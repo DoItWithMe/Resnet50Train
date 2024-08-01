@@ -2,7 +2,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torch import Tensor
+import torch.nn.functional as nnF
+from torch.nn.parameter import Parameter
+from torch.nn.modules.batchnorm import BatchNorm2d
+
 import torchvision.transforms as transforms
+from torchvision.transforms import functional as F
+import torchvision.models as models
+from torchvision.models.resnet import conv1x1, conv3x3
+
 from PIL import Image
 import numpy as np
 import random
@@ -11,15 +20,8 @@ import os
 import matplotlib.pyplot as plt
 from typing import Any
 import shutil
-from torchvision.transforms import functional as F
 
 from typing import Optional, Callable
-from torch import Tensor
-import torch.nn.functional as nnF
-import torchvision.models as models
-from torch.nn.parameter import Parameter
-from torch.nn.modules.batchnorm import BatchNorm2d
-from torchvision.models.resnet import conv1x1, conv3x3
 
 
 def get_time():
@@ -268,7 +270,7 @@ class ImageNetDataset(Dataset):
                 tmp_img = self.preprocess(tmp_img)
 
             neg_imgs.append(tmp_img)
-            if len(neg_imgs) >= int(0.5 * self.k_neg_samples):
+            if len(neg_imgs) >= int(0.8 * self.k_neg_samples):
                 break
 
         # # 将其他母本当成目前母本图片的负样本
@@ -465,7 +467,7 @@ def train(model, loader, criterion, optimizer, device, accumulation_steps, max_t
 
         if count % 100 == 0:
             print(
-                f"time:{get_time()}, train {count +1}/{total_len}:{((count + 1) / total_len * 100.0 ):.2f}% in one round..."
+                f"time: {get_time()}, train {count +1}/{total_len}:{((count + 1) / total_len * 100.0 ):.2f}% in one round..."
             )
 
         if max_train_smaples_num != -1 and count > max_train_smaples_num:
@@ -781,9 +783,6 @@ def calculate_correct_with_score_threshold(
     return correct / num * 100.0, fp_count / num * 100.0, fn_count / num * 100.0
 
 
-k_neg_samples = 40
-augmentations_num = 20
-
 vt_mean = [0.485, 0.456, 0.406]
 vt_std = [0.229, 0.224, 0.225]
 
@@ -808,20 +807,32 @@ augmentations = transforms.Compose(
         transforms.RandomRotation(degrees=15),
         # 高斯模糊
         transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),
-        # transforms.RandomResizedCrop([256, 256]),
-        # # 剪裁
-        # transforms.RandomResizedCrop(256),
-        # transforms.ToTensor(),
+        # 随机剪裁
+        transforms.RandomResizedCrop(256),
+        # 亮度变化, 对比度，饱和度，色调
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=[0.0, 0.3]), #type: ignore
     ]
 )
 
-train_dataset = ImageNetDataset(
-    dataset_dir="/data/jinzijian/assets/ImageNet2012/ILSVRC2012_img_train",
+k_neg_samples = 32
+augmentations_num = 32
+
+# train_dataset = ImageNetDataset(
+#     dataset_dir="/data/jinzijian/assets/ImageNet2012/ILSVRC2012_img_train",
+#     augmentations=augmentations,
+#     augmentations_num=augmentations_num,
+#     preprocess=preprocess,
+#     k_neg_samples=k_neg_samples,
+# )
+
+train_dataset = VtDataSet(
+    dataset_dir="/data/jinzijian/resnet50/assets/vt-imgs-for-test",
     augmentations=augmentations,
     augmentations_num=augmentations_num,
     preprocess=preprocess,
     k_neg_samples=k_neg_samples,
 )
+
 
 val_k_neg_samples = 5
 val_augmentations_num = 5
@@ -835,12 +846,12 @@ vt_val_dataset = VtDataSet(
 )
 
 
-num_workers = 10
+num_workers = 4
 
-batch_size = 64
+batch_size = 256
 
 # 梯度累积步数
-accumulation_steps = 32
+accumulation_steps = 128
 
 train_loader = DataLoader(
     train_dataset,
@@ -862,7 +873,7 @@ model = ResNet47_50Net()
 model = model.to(device)
 
 # 设置优化器
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
 
 # 设置学习率调度器
 scheduler = optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=10, gamma=0.1)
@@ -870,34 +881,46 @@ scheduler = optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=10, gamma=0
 # 设置损失函数
 criterion = LiftedStructuredLoss(margin=1.0)
 
-num_epochs = 30
-dis_threshold = 0.6
-score_threshold = 80
 
 output_plt_dir = "/data/jinzijian/resnet50/output"
-shutil.rmtree(output_plt_dir)
+try:
+    shutil.rmtree(output_plt_dir)
+except Exception as e:
+    pass
+
 os.mkdir(output_plt_dir)
+
+model_save_dir_path = "/data/jinzijian/resnet50/model-output"
+try:
+    shutil.rmtree(model_save_dir_path)
+except Exception as e:
+    pass
+os.mkdir(model_save_dir_path)
 
 sum_message = ""
 
 best_model_wts = None
 best_acc = 0.0
 
-max_train_smaples_num = 5000
-max_val_smaples_num = 50
+num_epochs = 60
+dis_threshold = 0.6
+score_threshold = 80
 
-model_save_dir_path = "/data/jinzijian/resnet50/model-output"
-shutil.rmtree(model_save_dir_path)
-os.mkdir(model_save_dir_path)
+max_train_smaples_num = 10000
+max_val_smaples_num = -1
+
+print("Could Run")
 for epoch in range(num_epochs):
-    print("start train ---")
+    print(f"time: {get_time()}, start train ---")
     t1 = time.time()
     train_loss = train(
         model, train_loader, criterion, optimizer, device, accumulation_steps, max_train_smaples_num
     )
+    # train_loss = 0
     t2 = time.time()
+    scheduler.step()
 
-    print("start valid -----------")
+    print(f"time: {get_time()}, start valid -----------")
     all_predictions_scores, all_labels, all_imgs, all_dis, all_master_img_path = (
         validate(model, vt_val_loader, device, dis_threshold, max_val_smaples_num)
     )
