@@ -6,6 +6,7 @@ from torch import Tensor
 import torch.nn.functional as nnF
 from torch.nn.parameter import Parameter
 from torch.nn.modules.batchnorm import BatchNorm2d
+from torch.cuda.amp import autocast, GradScaler
 
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
@@ -25,7 +26,8 @@ from typing import Optional, Callable
 
 
 def get_time():
-    return time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+
 
 def l2n(x: Tensor, eps: float = 1e-6) -> Tensor:
     return x / (torch.norm(x, p=2, dim=1, keepdim=True) + eps).expand_as(x)
@@ -428,14 +430,23 @@ def flatten_data(samples, labels, device):
 
 
 # 训练函数
-def train(model, loader, criterion, optimizer, device, accumulation_steps, max_train_smaples_num):
+def train(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    accumulation_steps,
+    max_train_smaples_num,
+):
     model.train()
     running_loss = 0.0
 
     count = 0
-    total_len = len(loader) if max_train_smaples_num == -1 else  max_train_smaples_num
+    total_len = len(loader) if max_train_smaples_num == -1 else max_train_smaples_num
     for i, (samples, labels, _) in enumerate(loader):
-        count = i
+        count = i + 1
         # print(f"i: {i}, samples: {samples.shape}, labels: {labels.shape}")
 
         # Flatten size and labels from [batch_size, num_samples_per_image, channels, height ,width] to [batch_size * num_samples_per_image, channels, height, width]
@@ -443,21 +454,31 @@ def train(model, loader, criterion, optimizer, device, accumulation_steps, max_t
         # print(
         #     f"i: {i}, samples: {samples.shape}, labels: {labels.shape}, flatten_samples: {flatten_samples.shape}, flatten_labels: {flatten_labels.shape}"
         # )
+        if device == "cuda":
+            with autocast():
+                outputs = model(flatten_samples)
+        else:
+            # 前向传播（Forward Pass）：计算模型的输出。
+            outputs = model(flatten_samples)
+            # 计算损失（Loss Calculation）：根据模型输出和真实标签计算损失。
 
-        # 前向传播（Forward Pass）：计算模型的输出。
-        outputs = model(flatten_samples)
-        # print(f"i: {i}, outputs: {outputs.shape}, outputs.squeeze(): {outputs.squeeze().shape}")
-
-        # 计算损失（Loss Calculation）：根据模型输出和真实标签计算损失。
         loss = criterion(outputs.squeeze(), flatten_labels)
         loss = loss / accumulation_steps
 
         # 计算梯度
-        loss.backward()
+        if device == "cuda":
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if (i + 1) % accumulation_steps == 0:
-            # 反向传播（Backward Pass）：计算损失函数相对于模型参数的梯度。
-            optimizer.step()
+            if device == "cuda":
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 反向传播（Backward Pass）：计算损失函数相对于模型参数的梯度。
+                optimizer.step()
+
             # 清空梯度
             optimizer.zero_grad()
 
@@ -465,17 +486,22 @@ def train(model, loader, criterion, optimizer, device, accumulation_steps, max_t
         del outputs
         del flatten_samples, flatten_labels
 
-        if count % 100 == 0:
+        if (count) % 100 == 0:
             print(
-                f"time: {get_time()}, train {count +1}/{total_len}:{((count + 1) / total_len * 100.0 ):.2f}% in one round..."
+                f"time: {get_time()}, train {count}/{total_len}:{((count ) / total_len * 100.0 ):.2f}% in one round..."
             )
 
-        if max_train_smaples_num != -1 and count > max_train_smaples_num:
+        if max_train_smaples_num != -1 and count >= max_train_smaples_num:
+            print(f"train: {count} / {max_train_smaples_num}, stop train...")
             break
 
-    if (count + 1) % accumulation_steps != 0:
-        # 反向传播（Backward Pass）：计算损失函数相对于模型参数的梯度。
-        optimizer.step()
+    if (count) % accumulation_steps != 0:
+        if device == "cuda":
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # 反向传播（Backward Pass）：计算损失函数相对于模型参数的梯度。
+            optimizer.step()
         # 清空梯度
         optimizer.zero_grad()
 
@@ -550,7 +576,7 @@ def validate(model, loader, device, dis_threshold, max_val_smaples_num):
             all_predictions_scores.append(predictions_scores)
             all_labels.append(flatten_labels.tolist())
             del outputs
-            if max_val_smaples_num != -1 and i > max_val_smaples_num:
+            if max_val_smaples_num != -1 and i + 1 >= max_val_smaples_num:
                 break
 
     return all_predictions_scores, all_labels, all_imgs, all_dis, all_master_img_path
@@ -810,35 +836,42 @@ augmentations = transforms.Compose(
         # 随机剪裁
         transforms.RandomResizedCrop(256),
         # 亮度变化, 对比度，饱和度，色调
-        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=[0.0, 0.3]), #type: ignore
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=[0.0, 0.3]),  # type: ignore
     ]
 )
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Use {device}")
+
+gpu_count = torch.cuda.device_count()
+
 
 k_neg_samples = 32
 augmentations_num = 32
 
-# train_dataset = ImageNetDataset(
-#     dataset_dir="/data/jinzijian/assets/ImageNet2012/ILSVRC2012_img_train",
-#     augmentations=augmentations,
-#     augmentations_num=augmentations_num,
-#     preprocess=preprocess,
-#     k_neg_samples=k_neg_samples,
-# )
-
-train_dataset = VtDataSet(
-    dataset_dir="/data/jinzijian/resnet50/assets/vt-imgs-for-test",
+train_dataset = ImageNetDataset(
+    dataset_dir="/mnt/data/ILSVRC2012_img_train",
     augmentations=augmentations,
     augmentations_num=augmentations_num,
     preprocess=preprocess,
     k_neg_samples=k_neg_samples,
 )
 
+# train_dataset = VtDataSet(
+#     dataset_dir="/data/jinzijian/resnet50/assets/vt-imgs-for-test",
+#     augmentations=augmentations,
+#     augmentations_num=augmentations_num,
+#     preprocess=preprocess,
+#     k_neg_samples=k_neg_samples,
+# )
+
 
 val_k_neg_samples = 5
 val_augmentations_num = 5
 
 vt_val_dataset = VtDataSet(
-    dataset_dir="/data/jinzijian/resnet50/assets/vt-imgs-for-test",
+    dataset_dir="/mnt/data/vt-imgs-for-test",
     augmentations=augmentations,
     augmentations_num=val_augmentations_num,
     preprocess=preprocess,
@@ -846,16 +879,21 @@ vt_val_dataset = VtDataSet(
 )
 
 
-num_workers = 4
+num_workers = 8
 
-batch_size = 256
+total_batch_size = 256
+
+batch_size = 2
 
 # 梯度累积步数
-accumulation_steps = 128
+if gpu_count > 1:
+    accumulation_steps = total_batch_size // (gpu_count * batch_size)
+else:
+    accumulation_steps = total_batch_size // batch_size
 
 train_loader = DataLoader(
     train_dataset,
-    batch_size=int(batch_size / accumulation_steps),
+    batch_size=batch_size,
     shuffle=True,
     num_workers=num_workers,
     drop_last=False,
@@ -865,11 +903,12 @@ vt_val_loader = DataLoader(
     vt_val_dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False
 )
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print(f"Use {device}")
 
 model = ResNet47_50Net()
+
+if gpu_count > 1:
+    model = nn.DataParallel(model)
+
 model = model.to(device)
 
 # 设置优化器
@@ -882,7 +921,7 @@ scheduler = optim.lr_scheduler.StepLR(optimizer=optimizer, step_size=10, gamma=0
 criterion = LiftedStructuredLoss(margin=1.0)
 
 
-output_plt_dir = "/data/jinzijian/resnet50/output"
+output_plt_dir = "/mnt/data/output/imgs"
 try:
     shutil.rmtree(output_plt_dir)
 except Exception as e:
@@ -890,7 +929,7 @@ except Exception as e:
 
 os.mkdir(output_plt_dir)
 
-model_save_dir_path = "/data/jinzijian/resnet50/model-output"
+model_save_dir_path = "/mnt/data/output/model"
 try:
     shutil.rmtree(model_save_dir_path)
 except Exception as e:
@@ -903,18 +942,27 @@ best_model_wts = None
 best_acc = 0.0
 
 num_epochs = 60
-dis_threshold = 0.6
+dis_threshold = 0.35
 score_threshold = 80
 
 max_train_smaples_num = 10000
 max_val_smaples_num = -1
+
+scaler = GradScaler()
 
 print("Could Run")
 for epoch in range(num_epochs):
     print(f"time: {get_time()}, start train ---")
     t1 = time.time()
     train_loss = train(
-        model, train_loader, criterion, optimizer, device, accumulation_steps, max_train_smaples_num
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        scaler,
+        device,
+        accumulation_steps,
+        max_train_smaples_num,
     )
     # train_loss = 0
     t2 = time.time()
@@ -956,4 +1004,6 @@ for epoch in range(num_epochs):
         best_model_wts = model.state_dict().copy()
         model_save_file_path = os.path.join(model_save_dir_path, f"{epoch}.pth")
         torch.save(best_model_wts, model_save_file_path)
-        print(f"time: {get_time()}, Best model saved with accuracy: {best_acc:.4f}, train round: {epoch}")
+        print(
+            f"time: {get_time()}, Best model saved with accuracy: {best_acc:.4f}, train round: {epoch}"
+        )
